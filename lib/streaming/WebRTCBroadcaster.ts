@@ -2,13 +2,37 @@
 
 import { getSocket } from '../socket/socketClient';
 
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
-  iceCandidatePoolSize: 2,
-};
+function getIceServers(): RTCConfiguration {
+  const iceServers: RTCIceServer[] = [
+    {
+      urls: [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
+      ],
+    },
+  ];
+
+  const turnUrl = process.env.NEXT_PUBLIC_TURN_URL;
+  const turnUsername = process.env.NEXT_PUBLIC_TURN_USERNAME;
+  const turnCredential = process.env.NEXT_PUBLIC_TURN_CREDENTIAL;
+
+  if (turnUrl) {
+    const urls = turnUrl.split(',').map((u) => u.trim()).filter(Boolean);
+    if (urls.length > 0) {
+      iceServers.push({
+        urls,
+        ...(turnUsername ? { username: turnUsername } : {}),
+        ...(turnCredential ? { credential: turnCredential } : {}),
+      });
+    }
+  }
+
+  return {
+    iceServers,
+    iceCandidatePoolSize: 2,
+  };
+}
 
 export interface BroadcasterDiagnostics {
   fps: number;
@@ -27,6 +51,7 @@ export class WebRTCBroadcaster {
   private micStream: MediaStream | null = null;
   private audioContext: AudioContext | null = null;
   private peerConnections: Map<string, RTCPeerConnection> = new Map();
+  private attemptIds: Map<string, string> = new Map();
   private pendingCandidates: Map<string, RTCIceCandidateInit[]> = new Map();
   private onEndedCallback?: () => void;
   private onDiagnosticsCallback?: (stats: BroadcasterDiagnostics) => void;
@@ -137,22 +162,30 @@ export class WebRTCBroadcaster {
     const socket = getSocket();
 
     socket.off('webrtc:new-viewer');
-    socket.on('webrtc:new-viewer', async (data: { viewerSocketId: string }) => {
+    socket.on('webrtc:new-viewer', async (data: { viewerSocketId: string; attemptId?: string }) => {
       const viewerSocketId = data.viewerSocketId;
       if (!this.localStream || !viewerSocketId) return;
 
-      console.log(`[Broadcaster] Signaling request for new viewer: ${viewerSocketId}`);
-      await this.initiatePeerConnection(viewerSocketId);
+      console.log(`[Broadcaster] Viewer joined: ${viewerSocketId} (attempt: ${data.attemptId || 'new'})`);
+      await this.initiatePeerConnection(viewerSocketId, data.attemptId);
     });
 
     socket.off('webrtc:answer');
-    socket.on('webrtc:answer', async (data: { answer: RTCSessionDescriptionInit; fromSocketId: string }) => {
+    socket.on('webrtc:answer', async (data: { answer: RTCSessionDescriptionInit; fromSocketId: string; attemptId?: string }) => {
       const pc = this.peerConnections.get(data.fromSocketId);
+      const activeAttemptId = this.attemptIds.get(data.fromSocketId);
+
+      // Verify attempt match if attemptId is provided
+      if (data.attemptId && activeAttemptId && data.attemptId !== activeAttemptId) {
+        console.warn(`[Broadcaster] Ignored stale answer from ${data.fromSocketId} (got: ${data.attemptId}, expected: ${activeAttemptId})`);
+        return;
+      }
+
       if (pc && data.answer) {
         try {
           if (pc.signalingState === 'have-local-offer') {
             await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-            console.log(`[Broadcaster] Remote answer set successfully for viewer: ${data.fromSocketId}`);
+            console.log(`[Broadcaster] Answer received from ${data.fromSocketId}. Remote description set.`);
 
             // Drain queued ICE candidates
             const pending = this.pendingCandidates.get(data.fromSocketId) || [];
@@ -162,6 +195,8 @@ export class WebRTCBroadcaster {
               );
             }
             this.pendingCandidates.delete(data.fromSocketId);
+          } else {
+            console.warn(`[Broadcaster] Answer from ${data.fromSocketId} ignored because signalingState is ${pc.signalingState}`);
           }
         } catch (e) {
           console.error('[Broadcaster] Failed setting remote description:', e);
@@ -170,8 +205,14 @@ export class WebRTCBroadcaster {
     });
 
     socket.off('webrtc:ice-candidate');
-    socket.on('webrtc:ice-candidate', async (data: { candidate: RTCIceCandidateInit; fromSocketId: string }) => {
+    socket.on('webrtc:ice-candidate', async (data: { candidate: RTCIceCandidateInit; fromSocketId: string; attemptId?: string }) => {
       const pc = this.peerConnections.get(data.fromSocketId);
+      const activeAttemptId = this.attemptIds.get(data.fromSocketId);
+
+      if (data.attemptId && activeAttemptId && data.attemptId !== activeAttemptId) {
+        return; // Ignore stale ICE candidate
+      }
+
       if (pc && data.candidate) {
         if (pc.remoteDescription && pc.remoteDescription.type) {
           try {
@@ -189,55 +230,74 @@ export class WebRTCBroadcaster {
     });
   }
 
-  private async initiatePeerConnection(viewerSocketId: string) {
+  private async initiatePeerConnection(viewerSocketId: string, attemptId?: string) {
     if (!this.localStream) return;
 
-    // Close any previous connection for this viewer
+    // 1. Clean up any existing connection for this viewer socket ID
     if (this.peerConnections.has(viewerSocketId)) {
       const oldPc = this.peerConnections.get(viewerSocketId);
-      oldPc?.close();
+      if (oldPc) {
+        oldPc.onconnectionstatechange = null;
+        oldPc.oniceconnectionstatechange = null;
+        oldPc.onicecandidate = null;
+        oldPc.close();
+      }
       this.peerConnections.delete(viewerSocketId);
       this.pendingCandidates.delete(viewerSocketId);
     }
 
-    const pc = new RTCPeerConnection(ICE_SERVERS);
+    const currentAttemptId = attemptId || `att_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    this.attemptIds.set(viewerSocketId, currentAttemptId);
+
+    console.log(`[Broadcaster] Creating PeerConnection for ${viewerSocketId} (attempt: ${currentAttemptId})`);
+    const pc = new RTCPeerConnection(getIceServers());
     this.peerConnections.set(viewerSocketId, pc);
 
-    // 1. Add local tracks (Video + Audio)
+    // 2. Add local tracks (Video + Audio)
     this.localStream.getTracks().forEach((track) => {
       pc.addTrack(track, this.localStream!);
       console.log(`[Broadcaster] Added track [${track.kind}] (${track.label}) to peer ${viewerSocketId}`);
     });
 
-    // 2. Setup ICE Candidate handler
+    // 3. Setup ICE Candidate handler
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         getSocket().emit('webrtc:ice-candidate', {
           targetSocketId: viewerSocketId,
           candidate: event.candidate,
+          attemptId: currentAttemptId,
         });
       }
     };
 
-    // 3. Monitor connection state
+    // 4. Monitor connection state
     pc.onconnectionstatechange = () => {
-      console.log(`[Broadcaster] Connection state [${viewerSocketId}]: ${pc.connectionState}`);
+      console.log(`[Broadcaster] Connection state for ${viewerSocketId}: ${pc.connectionState}`);
       if (
         pc.connectionState === 'disconnected' ||
         pc.connectionState === 'failed' ||
         pc.connectionState === 'closed'
       ) {
-        this.peerConnections.delete(viewerSocketId);
-        this.pendingCandidates.delete(viewerSocketId);
-        pc.close();
+        // Allow a brief moment before cleaning up to avoid race with immediate renegotiation
+        setTimeout(() => {
+          if (this.peerConnections.get(viewerSocketId) === pc && pc.connectionState === 'failed') {
+            this.peerConnections.delete(viewerSocketId);
+            this.pendingCandidates.delete(viewerSocketId);
+            this.attemptIds.delete(viewerSocketId);
+            pc.close();
+          }
+        }, 3000);
       }
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log(`[Broadcaster] ICE connection state [${viewerSocketId}]: ${pc.iceConnectionState}`);
+      console.log(`[Broadcaster] ICE connection state for ${viewerSocketId}: ${pc.iceConnectionState}`);
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        console.log(`[Broadcaster] ICE connected for ${viewerSocketId}`);
+      }
     };
 
-    // 4. Create Offer & Optimize Sender Parameters
+    // 5. Create Offer & Optimize Sender Parameters (3.5 Mbps @ 30fps)
     try {
       const offer = await pc.createOffer({
         offerToReceiveAudio: false,
@@ -246,7 +306,6 @@ export class WebRTCBroadcaster {
 
       await pc.setLocalDescription(offer);
 
-      // Optimize sender bitrate (3.5 Mbps target, 30fps max) to prevent lag and buffer bloat
       const senders = pc.getSenders();
       for (const sender of senders) {
         if (sender.track && sender.track.kind === 'video') {
@@ -259,7 +318,6 @@ export class WebRTCBroadcaster {
             params.encodings[0].maxFramerate = 30; // 30 fps cap
             (params as any).degradationPreference = 'maintain-framerate';
             await sender.setParameters(params);
-            console.log(`[Broadcaster] Sender parameters configured: 3.5 Mbps @ 30fps`);
           } catch (paramErr) {
             console.warn('[Broadcaster] Could not set sender parameters:', paramErr);
           }
@@ -269,9 +327,10 @@ export class WebRTCBroadcaster {
       getSocket().emit('webrtc:offer', {
         targetSocketId: viewerSocketId,
         offer: pc.localDescription,
+        attemptId: currentAttemptId,
       });
 
-      console.log(`[Broadcaster] Sent WebRTC offer to viewer: ${viewerSocketId}`);
+      console.log(`[Broadcaster] Offer sent to ${viewerSocketId} (attempt: ${currentAttemptId})`);
     } catch (err) {
       console.error('[Broadcaster] Error creating/sending offer:', err);
     }
@@ -357,8 +416,14 @@ export class WebRTCBroadcaster {
       this.statsInterval = null;
     }
 
-    this.peerConnections.forEach((pc) => pc.close());
+    this.peerConnections.forEach((pc) => {
+      pc.onconnectionstatechange = null;
+      pc.oniceconnectionstatechange = null;
+      pc.onicecandidate = null;
+      pc.close();
+    });
     this.peerConnections.clear();
+    this.attemptIds.clear();
     this.pendingCandidates.clear();
     this.prevBytesSent.clear();
 
