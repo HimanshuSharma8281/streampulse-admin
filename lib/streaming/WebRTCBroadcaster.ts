@@ -45,6 +45,10 @@ export interface BroadcasterDiagnostics {
   width: number;
   height: number;
   bitrateKbps: number;
+  framesSent: number;
+  framesEncoded: number;
+  keyFramesEncoded: number;
+  codec: string;
   activeViewersCount: number;
   videoTracksCount: number;
   audioTracksCount: number;
@@ -97,6 +101,14 @@ export class WebRTCBroadcaster {
           : false,
       });
 
+      const videoTrack = displayStream.getVideoTracks()[0];
+      const audioTrack = displayStream.getAudioTracks()[0];
+
+      console.log('[Broadcaster] Screen Capture Success:');
+      console.log(`  - Video Track: id=${videoTrack?.id}, readyState=${videoTrack?.readyState}, enabled=${videoTrack?.enabled}, muted=${videoTrack?.muted}`);
+      console.log(`  - Video Settings:`, videoTrack?.getSettings());
+      console.log(`  - Audio Track: id=${audioTrack?.id}, readyState=${audioTrack?.readyState}, enabled=${audioTrack?.enabled}`);
+
       // 2. Mix microphone audio if explicitly requested and mic is available
       if (includeMic) {
         try {
@@ -142,19 +154,15 @@ export class WebRTCBroadcaster {
 
       this.localStream = displayStream;
 
-      const videoTrack = displayStream.getVideoTracks()[0];
       if (videoTrack) {
         videoTrack.onended = () => {
+          console.log('[Broadcaster] Video track ended by user');
           this.stop();
           if (this.onEndedCallback) {
             this.onEndedCallback();
           }
         };
       }
-
-      console.log(
-        `[Broadcaster] Captured Stream: Video Tracks: ${displayStream.getVideoTracks().length}, Audio Tracks: ${displayStream.getAudioTracks().length}`
-      );
 
       return displayStream;
     } catch (err: any) {
@@ -264,7 +272,7 @@ export class WebRTCBroadcaster {
     // 2. Add local tracks (Video + Audio)
     this.localStream.getTracks().forEach((track) => {
       pc.addTrack(track, this.localStream!);
-      console.log(`[Broadcaster] Added track [${track.kind}] (${track.label}) to peer ${viewerSocketId}`);
+      console.log(`[Broadcaster] Added track [${track.kind}] (${track.label}, enabled=${track.enabled}, readyState=${track.readyState}) to peer ${viewerSocketId}`);
     });
 
     // 3. Setup ICE Candidate handler
@@ -273,7 +281,7 @@ export class WebRTCBroadcaster {
         const candidateStr = event.candidate.candidate || '';
         const candType = event.candidate.type || (candidateStr.includes('typ relay') ? 'relay' : candidateStr.includes('typ srflx') ? 'srflx' : 'host');
         const proto = event.candidate.protocol || (candidateStr.includes('udp') ? 'udp' : 'tcp');
-        console.log(`[WebRTC] ICE candidate gathered: type=${candType}, proto=${proto}`);
+        console.log(`[WebRTC Broadcaster] ICE candidate gathered: type=${candType}, proto=${proto}`);
 
         getSocket().emit('webrtc:ice-candidate', {
           targetSocketId: viewerSocketId,
@@ -281,12 +289,12 @@ export class WebRTCBroadcaster {
           attemptId: currentAttemptId,
         });
       } else {
-        console.log(`[WebRTC] ICE gathering complete for ${viewerSocketId}`);
+        console.log(`[WebRTC Broadcaster] ICE gathering complete for ${viewerSocketId}`);
       }
     };
 
     pc.onicegatheringstatechange = () => {
-      console.log(`[WebRTC] ICE gathering state for ${viewerSocketId}: ${pc.iceGatheringState}`);
+      console.log(`[WebRTC Broadcaster] ICE gathering state for ${viewerSocketId}: ${pc.iceGatheringState}`);
     };
 
     // 4. Monitor connection state
@@ -367,6 +375,10 @@ export class WebRTCBroadcaster {
             width: settings?.width || 0,
             height: settings?.height || 0,
             bitrateKbps: 0,
+            framesSent: 0,
+            framesEncoded: 0,
+            keyFramesEncoded: 0,
+            codec: 'unknown',
             activeViewersCount: 0,
             videoTracksCount: this.localStream.getVideoTracks().length,
             audioTracksCount: this.localStream.getAudioTracks().length,
@@ -379,6 +391,10 @@ export class WebRTCBroadcaster {
 
       let totalBitrateKbps = 0;
       let observedFps = 30;
+      let framesSentTotal = 0;
+      let framesEncodedTotal = 0;
+      let keyFramesEncodedTotal = 0;
+      let negotiatedCodec = 'video/VP8';
       let candidatePairType = 'direct';
 
       const pcEntries = Array.from(this.peerConnections.entries());
@@ -389,6 +405,10 @@ export class WebRTCBroadcaster {
 
           stats.forEach((report) => {
             if (report.type === 'outbound-rtp' && report.kind === 'video') {
+              if (report.framesSent) framesSentTotal += report.framesSent;
+              if (report.framesEncoded) framesEncodedTotal += report.framesEncoded;
+              if (report.keyFramesEncoded) keyFramesEncodedTotal += report.keyFramesEncoded;
+
               const prev = this.prevBytesSent.get(viewerId);
               if (prev && report.bytesSent) {
                 const deltaBytes = report.bytesSent - prev.bytes;
@@ -404,6 +424,15 @@ export class WebRTCBroadcaster {
               if (report.bytesSent) {
                 this.prevBytesSent.set(viewerId, { bytes: report.bytesSent, timestamp: now });
               }
+
+              if (report.codecId) {
+                const codecReport = stats.get(report.codecId);
+                if (codecReport && codecReport.mimeType) {
+                  negotiatedCodec = codecReport.mimeType;
+                }
+              }
+
+              console.log(`[Broadcaster Diagnostic] Video Outbound: codec=${negotiatedCodec} | txFrames=${report.framesSent} | encFrames=${report.framesEncoded} | keyFrames=${report.keyFramesEncoded} | fps=${report.framesPerSecond || observedFps} | txBytes=${report.bytesSent}`);
             }
 
             if (report.type === 'candidate-pair' && (report.state === 'succeeded' || report.nominated)) {
@@ -433,6 +462,10 @@ export class WebRTCBroadcaster {
           width: settings?.width || 1280,
           height: settings?.height || 720,
           bitrateKbps: totalBitrateKbps,
+          framesSent: framesSentTotal,
+          framesEncoded: framesEncodedTotal,
+          keyFramesEncoded: keyFramesEncodedTotal,
+          codec: negotiatedCodec,
           activeViewersCount: this.peerConnections.size,
           videoTracksCount: this.localStream.getVideoTracks().length,
           audioTracksCount: this.localStream.getAudioTracks().length,
@@ -441,7 +474,7 @@ export class WebRTCBroadcaster {
           selectedCandidateType: candidatePairType,
         });
       }
-    }, 3000);
+    }, 2000);
   }
 
   public stop(): void {
