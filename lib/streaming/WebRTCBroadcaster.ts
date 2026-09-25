@@ -17,20 +17,26 @@ function getIceServers(): RTCConfiguration {
   const turnUsername = process.env.NEXT_PUBLIC_TURN_USERNAME;
   const turnCredential = process.env.NEXT_PUBLIC_TURN_CREDENTIAL;
 
-  if (turnUrl) {
-    const urls = turnUrl.split(',').map((u) => u.trim()).filter(Boolean);
-    if (urls.length > 0) {
-      iceServers.push({
-        urls,
-        ...(turnUsername ? { username: turnUsername } : {}),
-        ...(turnCredential ? { credential: turnCredential } : {}),
-      });
+  if (turnUrl && turnUrl.trim() !== '') {
+    const rawUrls = turnUrl.split(',').map((u) => u.trim()).filter(Boolean);
+    if (rawUrls.length > 0) {
+      const turnEntry: RTCIceServer = {
+        urls: rawUrls,
+      };
+      if (turnUsername && turnUsername.trim() !== '') {
+        turnEntry.username = turnUsername.trim();
+      }
+      if (turnCredential && turnCredential.trim() !== '') {
+        turnEntry.credential = turnCredential.trim();
+      }
+      iceServers.push(turnEntry);
     }
   }
 
   return {
     iceServers,
     iceCandidatePoolSize: 2,
+    iceTransportPolicy: 'all',
   };
 }
 
@@ -44,6 +50,7 @@ export interface BroadcasterDiagnostics {
   audioTracksCount: number;
   hasAudio: boolean;
   audioLabel?: string;
+  selectedCandidateType?: string;
 }
 
 export class WebRTCBroadcaster {
@@ -239,6 +246,7 @@ export class WebRTCBroadcaster {
       if (oldPc) {
         oldPc.onconnectionstatechange = null;
         oldPc.oniceconnectionstatechange = null;
+        oldPc.onicegatheringstatechange = null;
         oldPc.onicecandidate = null;
         oldPc.close();
       }
@@ -262,12 +270,23 @@ export class WebRTCBroadcaster {
     // 3. Setup ICE Candidate handler
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        const candidateStr = event.candidate.candidate || '';
+        const candType = event.candidate.type || (candidateStr.includes('typ relay') ? 'relay' : candidateStr.includes('typ srflx') ? 'srflx' : 'host');
+        const proto = event.candidate.protocol || (candidateStr.includes('udp') ? 'udp' : 'tcp');
+        console.log(`[WebRTC] ICE candidate gathered: type=${candType}, proto=${proto}`);
+
         getSocket().emit('webrtc:ice-candidate', {
           targetSocketId: viewerSocketId,
           candidate: event.candidate,
           attemptId: currentAttemptId,
         });
+      } else {
+        console.log(`[WebRTC] ICE gathering complete for ${viewerSocketId}`);
       }
+    };
+
+    pc.onicegatheringstatechange = () => {
+      console.log(`[WebRTC] ICE gathering state for ${viewerSocketId}: ${pc.iceGatheringState}`);
     };
 
     // 4. Monitor connection state
@@ -278,9 +297,8 @@ export class WebRTCBroadcaster {
         pc.connectionState === 'failed' ||
         pc.connectionState === 'closed'
       ) {
-        // Allow a brief moment before cleaning up to avoid race with immediate renegotiation
         setTimeout(() => {
-          if (this.peerConnections.get(viewerSocketId) === pc && pc.connectionState === 'failed') {
+          if (this.peerConnections.get(viewerSocketId) === pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) {
             this.peerConnections.delete(viewerSocketId);
             this.pendingCandidates.delete(viewerSocketId);
             this.attemptIds.delete(viewerSocketId);
@@ -361,6 +379,7 @@ export class WebRTCBroadcaster {
 
       let totalBitrateKbps = 0;
       let observedFps = 30;
+      let candidatePairType = 'direct';
 
       const pcEntries = Array.from(this.peerConnections.entries());
       for (const [viewerId, pc] of pcEntries) {
@@ -386,6 +405,20 @@ export class WebRTCBroadcaster {
                 this.prevBytesSent.set(viewerId, { bytes: report.bytesSent, timestamp: now });
               }
             }
+
+            if (report.type === 'candidate-pair' && (report.state === 'succeeded' || report.nominated)) {
+              const localCand = stats.get(report.localCandidateId);
+              const remoteCand = stats.get(report.remoteCandidateId);
+              const localType = localCand?.candidateType || 'host';
+              const remoteType = remoteCand?.candidateType || 'host';
+              if (localType === 'relay' || remoteType === 'relay') {
+                candidatePairType = 'TURN Relay';
+              } else if (localType === 'srflx' || remoteType === 'srflx') {
+                candidatePairType = 'STUN srflx';
+              } else {
+                candidatePairType = 'Direct P2P';
+              }
+            }
           });
         } catch (e) {}
       }
@@ -405,6 +438,7 @@ export class WebRTCBroadcaster {
           audioTracksCount: this.localStream.getAudioTracks().length,
           hasAudio: Boolean(audioTrack),
           audioLabel: audioTrack?.label,
+          selectedCandidateType: candidatePairType,
         });
       }
     }, 3000);
@@ -419,6 +453,7 @@ export class WebRTCBroadcaster {
     this.peerConnections.forEach((pc) => {
       pc.onconnectionstatechange = null;
       pc.oniceconnectionstatechange = null;
+      pc.onicegatheringstatechange = null;
       pc.onicecandidate = null;
       pc.close();
     });
