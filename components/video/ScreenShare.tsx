@@ -1,18 +1,21 @@
 'use client';
 
 import React, { useRef, useEffect } from 'react';
-import { Monitor, Volume2, VolumeX, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { Monitor, Volume2, VolumeX, AlertCircle, CheckCircle2, Activity } from 'lucide-react';
+import { BroadcasterDiagnostics } from '@/lib/streaming/WebRTCBroadcaster';
 
 interface ScreenShareProps {
   stream: MediaStream | null;
   isLive: boolean;
   error?: string | null;
+  diagnostics?: BroadcasterDiagnostics | null;
   onRetry?: () => void;
 }
 
 export const ScreenShare: React.FC<ScreenShareProps> = ({
   stream,
   error,
+  diagnostics,
   onRetry,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -23,11 +26,13 @@ export const ScreenShare: React.FC<ScreenShareProps> = ({
     }
   }, [stream]);
 
-  const hasAudioTrack = Boolean(stream && stream.getAudioTracks().length > 0);
-  const videoTrack = stream ? stream.getVideoTracks()[0] : null;
+  const videoTracks = stream ? stream.getVideoTracks() : [];
+  const audioTracks = stream ? stream.getAudioTracks() : [];
+  const hasAudioTrack = audioTracks.length > 0;
+  const videoTrack = videoTracks[0] || null;
   const settings = videoTrack ? videoTrack.getSettings() : null;
-  const resolution = settings?.width ? `${settings.width}x${settings.height}` : '1080p';
-  const frameRate = settings?.frameRate ? Math.round(settings.frameRate) : 30;
+  const resolution = settings?.width ? `${settings.width}x${settings.height}` : '720p/1080p';
+  const frameRate = diagnostics?.fps || (settings?.frameRate ? Math.round(settings.frameRate) : 30);
 
   return (
     <div className="relative w-full aspect-video bg-[#000000] rounded-2xl overflow-hidden shadow-2xl border border-white/10 flex items-center justify-center group">
@@ -48,7 +53,7 @@ export const ScreenShare: React.FC<ScreenShareProps> = ({
           </div>
           <h3 className="text-base font-bold text-white mb-1">Screen Capture Preview</h3>
           <p className="text-xs text-slate-400 max-w-sm">
-            Click &quot;Start Live Stream&quot; below to select your laptop screen, window, or browser tab.
+            Click &quot;Start Live Stream&quot; below. Make sure to check <strong>&quot;Share audio&quot;</strong> in your browser dialog if you want viewers to hear screen sound.
           </p>
         </div>
       )}
@@ -72,32 +77,50 @@ export const ScreenShare: React.FC<ScreenShareProps> = ({
       )}
 
       {stream && (
-        <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none z-10">
-          <div className="flex items-center gap-2 pointer-events-auto">
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-500/90 text-white text-xs font-bold tracking-wide shadow">
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              CAPTURER ACTIVE
-            </span>
+        <>
+          {/* Top Status Bar */}
+          <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none z-10">
+            <div className="flex items-center gap-2 pointer-events-auto">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-500/90 text-white text-xs font-bold tracking-wide shadow">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                CAPTURER ACTIVE
+              </span>
 
-            <span className="px-2.5 py-1 rounded-md bg-black/60 backdrop-blur-md text-slate-200 border border-white/10 text-xs font-medium">
-              {resolution} @ {frameRate}fps
-            </span>
+              <span className="px-2.5 py-1 rounded-md bg-black/60 backdrop-blur-md text-slate-200 border border-white/10 text-xs font-medium">
+                Video: {videoTracks.length} track ({resolution} @ {frameRate}fps)
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 pointer-events-auto">
+              {hasAudioTrack ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-950/80 backdrop-blur-md text-emerald-300 border border-emerald-500/40 text-xs font-semibold shadow">
+                  <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+                  Audio: {audioTracks.length} track (Active)
+                </span>
+              ) : (
+                <span
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-950/80 backdrop-blur-md text-amber-300 border border-amber-500/40 text-xs font-semibold shadow"
+                  title="No audio track captured. Check 'Share audio' in browser prompt."
+                >
+                  <VolumeX className="w-3.5 h-3.5 text-amber-400" />
+                  Audio: 0 tracks (No system audio captured)
+                </span>
+              )}
+            </div>
           </div>
 
-          <div className="pointer-events-auto">
-            {hasAudioTrack ? (
-              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-black/60 backdrop-blur-md text-emerald-400 border border-emerald-500/30 text-xs font-medium">
-                <Volume2 className="w-3.5 h-3.5" />
-                Audio Active
-              </span>
-            ) : (
-              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-black/60 backdrop-blur-md text-amber-400 border border-amber-500/30 text-xs font-medium">
-                <VolumeX className="w-3.5 h-3.5" />
-                No Audio Track
-              </span>
-            )}
-          </div>
-        </div>
+          {/* Bottom Telemetry Bar */}
+          {diagnostics && diagnostics.bitrateKbps > 0 && (
+            <div className="absolute bottom-3 left-3 flex items-center gap-2 pointer-events-auto z-10 bg-black/70 backdrop-blur-md px-3 py-1 rounded-lg border border-white/10 text-[11px] font-mono text-slate-300">
+              <Activity className="w-3 h-3 text-indigo-400" />
+              <span>Bitrate: {(diagnostics.bitrateKbps / 1000).toFixed(1)} Mbps</span>
+              <span className="text-slate-600">|</span>
+              <span>FPS: {diagnostics.fps}</span>
+              <span className="text-slate-600">|</span>
+              <span>WebRTC Peers: {diagnostics.activeViewersCount}</span>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

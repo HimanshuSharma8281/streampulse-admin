@@ -6,7 +6,7 @@ import { ScreenShare } from '@/components/video/ScreenShare';
 import { StreamControls } from '@/components/video/StreamControls';
 import { StreamAnalytics } from '@/components/stream/StreamAnalytics';
 import { LiveChat } from '@/components/chat/LiveChat';
-import { WebRTCBroadcaster } from '@/lib/streaming/WebRTCBroadcaster';
+import { WebRTCBroadcaster, BroadcasterDiagnostics } from '@/lib/streaming/WebRTCBroadcaster';
 import { getSocket } from '@/lib/socket/socketClient';
 import { StreamStats } from '@/lib/types';
 
@@ -23,6 +23,7 @@ export default function AdminDashboardPage() {
   const [startedAt, setStartedAt] = useState<string | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<BroadcasterDiagnostics | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
   const [stats, setStats] = useState<StreamStats>({
@@ -95,9 +96,14 @@ export default function AdminDashboardPage() {
     setIsLoading(true);
 
     try {
-      const broadcaster = new WebRTCBroadcaster(() => {
-        handleStopStream();
-      });
+      const broadcaster = new WebRTCBroadcaster(
+        () => {
+          handleStopStream();
+        },
+        (diag) => {
+          setDiagnostics(diag);
+        }
+      );
 
       const mediaStream = await broadcaster.startScreenCapture(includeAudio, includeMic);
       setScreenStream(mediaStream);
@@ -130,6 +136,7 @@ export default function AdminDashboardPage() {
       broadcasterRef.current = null;
     }
     setScreenStream(null);
+    setDiagnostics(null);
     setIsLive(false);
 
     const socket = getSocket();
@@ -158,6 +165,7 @@ export default function AdminDashboardPage() {
               stream={screenStream}
               isLive={isLive}
               error={captureError}
+              diagnostics={diagnostics}
               onRetry={handleStartStream}
             />
 
