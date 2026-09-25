@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { useRouter } from 'next/navigation';
 import { AdminNavbar } from '@/components/ui/AdminNavbar';
 import { ScreenShare } from '@/components/video/ScreenShare';
 import { StreamControls } from '@/components/video/StreamControls';
@@ -12,10 +11,6 @@ import { getSocket } from '@/lib/socket/socketClient';
 import { StreamStats } from '@/lib/types';
 
 export default function AdminDashboardPage() {
-  const router = useRouter();
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [isVerifying, setIsVerifying] = useState(true);
-
   const [title, setTitle] = useState('Football Live — English Commentary & Match Analysis');
   const [description, setDescription] = useState(
     'Broadcasting live high-definition screen and commentary. Join the real-time chat and enjoy the stream!'
@@ -40,45 +35,18 @@ export default function AdminDashboardPage() {
 
   const broadcasterRef = useRef<WebRTCBroadcaster | null>(null);
 
+  // Setup Socket Telemetry and Stream State
   useEffect(() => {
-    const checkAuth = async () => {
-      try {
-        const token = sessionStorage.getItem('admin_token');
-        const res = await fetch('/api/admin/verify', {
-          headers: token ? { 'x-admin-token': token } : {},
-        });
+    const socket = getSocket();
 
-        if (!res.ok) {
-          const statusRes = await fetch('/api/admin/status');
-          const statusData = await statusRes.json();
-          if (statusData.setupRequired) {
-            router.replace('/setup');
-          } else {
-            router.replace('/login');
-          }
-          return;
-        }
+    // Fetch current stream state from server
+    const serverUrl = process.env.NEXT_PUBLIC_STREAM_SERVER_URL || '';
+    const stateEndpoint = serverUrl ? `${serverUrl.replace(/\/+$/, '')}/api/stream/state` : '/api/stream/state';
 
-        setIsAuthenticated(true);
-        setIsVerifying(false);
-
-        const socket = getSocket();
-        socket.emit('admin:auth', { token });
-      } catch (e) {
-        router.replace('/login');
-      }
-    };
-
-    checkAuth();
-  }, [router]);
-
-  useEffect(() => {
-    if (!isAuthenticated) return;
-
-    fetch('/api/stream/state')
+    fetch(stateEndpoint)
       .then((res) => res.json())
       .then((data) => {
-        if (data) {
+        if (data && data.title) {
           setTitle(data.title || title);
           setDescription(data.description || description);
           setCategory(data.category || category);
@@ -95,7 +63,12 @@ export default function AdminDashboardPage() {
       })
       .catch(() => {});
 
-    const socket = getSocket();
+    socket.on('stream:init', (data: any) => {
+      if (data?.stream) {
+        setIsLive(data.stream.status === 'live');
+        setStartedAt(data.stream.started_at || null);
+      }
+    });
 
     socket.on('stream:viewer-count', (data: { current: number; peak: number; totalUnique: number }) => {
       setStats((prev) => ({
@@ -110,16 +83,12 @@ export default function AdminDashboardPage() {
       setStats((prev) => ({ ...prev, messagesCount: prev.messagesCount + 1 }));
     });
 
-    socket.on('admin:error', (err: { message: string }) => {
-      setCaptureError(err.message);
-    });
-
     return () => {
+      socket.off('stream:init');
       socket.off('stream:viewer-count');
       socket.off('chat:new-message');
-      socket.off('admin:error');
     };
-  }, [isAuthenticated]);
+  }, [title, description, category]);
 
   const handleStartStream = async () => {
     setCaptureError(null);
@@ -176,26 +145,9 @@ export default function AdminDashboardPage() {
     });
   };
 
-  const handleLogout = async () => {
-    try {
-      await fetch('/api/admin/logout', { method: 'POST' });
-    } catch (e) {}
-    sessionStorage.removeItem('admin_token');
-    router.replace('/login');
-  };
-
-  if (isVerifying) {
-    return (
-      <div className="min-h-screen bg-[#090a0f] flex flex-col items-center justify-center space-y-3">
-        <div className="w-10 h-10 rounded-full border-2 border-indigo-500 border-t-transparent animate-spin" />
-        <p className="text-xs text-slate-400">Verifying Admin Session...</p>
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-screen bg-[#090a0f] flex flex-col selection:bg-indigo-500">
-      <AdminNavbar isLive={isLive} onLogout={handleLogout} />
+      <AdminNavbar isLive={isLive} />
 
       <main className="flex-1 max-w-[1600px] w-full mx-auto p-4 sm:p-6 space-y-6">
         <StreamAnalytics stats={stats} isLive={isLive} startedAt={startedAt} />
